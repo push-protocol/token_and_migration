@@ -25,6 +25,10 @@ contract MigrationLocker is Initializable, Ownable2StepUpgradeable, PausableUpgr
     mapping(uint256 => uint256) public epochStartBlock;
     /// @notice The address of the PUSH token
     address public constant PUSH_TOKEN = 0xf418588522d5dd018b425E472991E52EBBeEEEEE;
+    /// @notice Indicates whether owner-driven refunds are enabled for this locker instance
+    bool public refundsEnabled;
+    /// @notice Tracks the still-claimable refundable amount by sender, recipient, and epoch
+    mapping(address => mapping(address => mapping(uint256 => uint256))) public lockedBySenderRecipientEpoch;
 
     /**
      * EVENTS and ERRORS ******
@@ -39,6 +43,8 @@ contract MigrationLocker is Initializable, Ownable2StepUpgradeable, PausableUpgr
 
     /// @notice Emitted when a admin initiates a new epoch
     event NewEpoch(uint256 epoch, uint256 startBlock);
+    /// @notice Emitted when the owner refunds locked tokens back to the original sender
+    event Unlocked(address indexed sender, address indexed recipient, uint256 amount, uint256 epoch);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -47,11 +53,13 @@ contract MigrationLocker is Initializable, Ownable2StepUpgradeable, PausableUpgr
 
     /// @notice Initializes the contract instead of constructor
     /// @param initialOwner The address of the admin
-    function initialize(address initialOwner) public initializer {
+    /// @param refundsEnabled_ Whether this locker instance supports owner-driven refunds
+    function initialize(address initialOwner, bool refundsEnabled_) public initializer {
         require(initialOwner != address(0), "Invalid owner");
         __Ownable2Step_init();
         __Ownable_init(initialOwner);
         __Pausable_init();
+        refundsEnabled = refundsEnabled_;
 
         initiateNewEpoch();
     }
@@ -90,6 +98,7 @@ contract MigrationLocker is Initializable, Ownable2StepUpgradeable, PausableUpgr
         }
 
         IERC20(PUSH_TOKEN).safeTransferFrom(msg.sender, address(this), _amount);
+        lockedBySenderRecipientEpoch[msg.sender][_recipient][epoch] += _amount;
         emit Locked(msg.sender, _recipient, _amount, epoch);
     }
 
@@ -125,9 +134,32 @@ contract MigrationLocker is Initializable, Ownable2StepUpgradeable, PausableUpgr
         // Use permit to approve tokens for this contract
         IPUSH(PUSH_TOKEN).permit(msg.sender, address(this), _amount, _deadline, _v, _r, _s);
 
-        // Transfer the approved tokens to this contract
         IERC20(PUSH_TOKEN).safeTransferFrom(msg.sender, address(this), _amount);
+        lockedBySenderRecipientEpoch[msg.sender][_recipient][epoch] += _amount;
         emit Locked(msg.sender, _recipient, _amount, epoch);
+    }
+
+    /// @notice Allows the owner to refund locked PUSH back to the original sender
+    /// @param _sender The original locker address that supplied the PUSH
+    /// @param _recipient The claim recipient that was set during locking
+    /// @param _amount The amount to refund
+    /// @param _epoch The epoch bucket from which to refund
+    function refundLockedFunds(address _sender, address _recipient, uint256 _amount, uint256 _epoch)
+        external
+        onlyOwner
+        whenNotPaused
+    {
+        require(refundsEnabled, "Refunds disabled");
+        require(_sender != address(0), "Invalid sender");
+        require(_amount > 0, "Invalid amount");
+
+        uint256 refundableAmount = lockedBySenderRecipientEpoch[_sender][_recipient][_epoch];
+        require(refundableAmount >= _amount, "Insufficient locked balance");
+
+        lockedBySenderRecipientEpoch[_sender][_recipient][_epoch] = refundableAmount - _amount;
+        IERC20(PUSH_TOKEN).safeTransfer(_sender, _amount);
+
+        emit Unlocked(_sender, _recipient, _amount, _epoch);
     }
 
     /// @notice Allows the owner to burn a specified amount of tokens
@@ -139,6 +171,7 @@ contract MigrationLocker is Initializable, Ownable2StepUpgradeable, PausableUpgr
     }
 
     function recoverFunds(address _token, address _to, uint256 _amount) external onlyOwner whenNotPaused {
+        require(_token != PUSH_TOKEN, "PUSH recovery disabled");
         require(_to != address(0), "Invalid recipient");
 
         require(_amount > 0 && _amount <= IERC20(_token).balanceOf(address(this)), "Invalid amount");
