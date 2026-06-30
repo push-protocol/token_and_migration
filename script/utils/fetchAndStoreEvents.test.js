@@ -1,13 +1,79 @@
-const test = require("node:test");
+const { afterEach, test } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { buildNetClaims } = require("./fetchAndStoreEvents");
+const { LOCKER_SOURCES } = require("./config");
+const { buildNetClaims, mergeClaims, resolveLockerSources } = require("./fetchAndStoreEvents");
 
 const alice = "0x00000000000000000000000000000000000000a1";
 const bob = "0x00000000000000000000000000000000000000b2";
 const carol = "0x00000000000000000000000000000000000000c3";
+const originalPreMigrationAddress = LOCKER_SOURCES.preMigration.CONTRACT_ADDRESS;
+const originalPreMigrationEpochs = [...LOCKER_SOURCES.preMigration.FILTER_EPOCHS];
+const originalMigrationAddress = LOCKER_SOURCES.migration.CONTRACT_ADDRESS;
+const originalMigrationEpochs = [...LOCKER_SOURCES.migration.FILTER_EPOCHS];
 
-test("buildNetClaims handles locked entries", () => {
+afterEach(() => {
+  LOCKER_SOURCES.preMigration.CONTRACT_ADDRESS = originalPreMigrationAddress;
+  LOCKER_SOURCES.preMigration.FILTER_EPOCHS = [...originalPreMigrationEpochs];
+  LOCKER_SOURCES.migration.CONTRACT_ADDRESS = originalMigrationAddress;
+  LOCKER_SOURCES.migration.FILTER_EPOCHS = [...originalMigrationEpochs];
+});
+
+test("resolveLockerSources rejects missing contract addresses", () => {
+  LOCKER_SOURCES.preMigration.CONTRACT_ADDRESS = "";
+  LOCKER_SOURCES.migration.CONTRACT_ADDRESS = "";
+
+  assert.throws(
+    () => resolveLockerSources(),
+    /Both preMigration and migration contract addresses must be configured/
+  );
+});
+
+test("resolveLockerSources rejects identical pre and migration addresses", () => {
+  LOCKER_SOURCES.preMigration.CONTRACT_ADDRESS = "0x00000000000000000000000000000000000000aa";
+  LOCKER_SOURCES.migration.CONTRACT_ADDRESS = "0x00000000000000000000000000000000000000AA";
+
+  assert.throws(
+    () => resolveLockerSources(),
+    /preMigration and migration must be different contract addresses/
+  );
+});
+
+test("resolveLockerSources builds the fixed two-source topology", () => {
+  LOCKER_SOURCES.preMigration.CONTRACT_ADDRESS = "0x00000000000000000000000000000000000000aa";
+  LOCKER_SOURCES.preMigration.FILTER_EPOCHS = [1];
+  LOCKER_SOURCES.migration.CONTRACT_ADDRESS = "0x00000000000000000000000000000000000000bb";
+  LOCKER_SOURCES.migration.FILTER_EPOCHS = [];
+
+  assert.deepEqual(resolveLockerSources(), [
+    {
+      NAME: "pre-migration",
+      CONTRACT_ADDRESS: "0x00000000000000000000000000000000000000aa",
+      ABI: [
+        "event Locked(address caller, address recipient, uint256 amount, uint256 epoch)",
+        "event Unlocked(address sender, address recipient, uint256 amount, uint256 epoch)",
+        "function epoch() view returns (uint256)",
+        "function epochStartBlock(uint256) view returns (uint256)"
+      ],
+      FILTER_EPOCHS: [1],
+      INCLUDE_UNLOCKED: true
+    },
+    {
+      NAME: "migration",
+      CONTRACT_ADDRESS: "0x00000000000000000000000000000000000000bb",
+      ABI: [
+        "event Locked(address caller, address recipient, uint256 amount, uint256 epoch)",
+        "event Unlocked(address sender, address recipient, uint256 amount, uint256 epoch)",
+        "function epoch() view returns (uint256)",
+        "function epochStartBlock(uint256) view returns (uint256)"
+      ],
+      FILTER_EPOCHS: [],
+      INCLUDE_UNLOCKED: false
+    }
+  ]);
+});
+
+test("buildNetClaims handles pre-migration locked entries", () => {
   const result = buildNetClaims([
     { sender: alice, recipient: bob, amount: 100n, epoch: 1 }
   ]);
@@ -37,10 +103,14 @@ test("buildNetClaims subtracts unlocked entries from the correct sender-recipien
   assert.equal(result.unlockedTotalsByEpoch["1"], 30n);
 });
 
-test("buildNetClaims drops fully refunded entries", () => {
+test("buildNetClaims drops fully refunded pre-migration entries", () => {
   const result = buildNetClaims(
-    [{ sender: alice, recipient: bob, amount: 100n, epoch: 1 }],
-    [{ sender: alice, recipient: bob, amount: 100n, epoch: 1 }]
+    [
+      { sender: alice, recipient: bob, amount: 100n, epoch: 1 }
+    ],
+    [
+      { sender: alice, recipient: bob, amount: 100n, epoch: 1 }
+    ]
   );
 
   assert.deepEqual(result.claims, []);
@@ -55,4 +125,38 @@ test("buildNetClaims rejects negative net amounts", () => {
       ),
     /Negative net amount/
   );
+});
+
+test("mergeClaims merges pre and main epoch 1 into a single recipient+epoch claim", () => {
+  const preClaims = buildNetClaims([
+    { sender: alice, recipient: bob, amount: 100n, epoch: 1 }
+  ]).claims;
+  const mainClaims = buildNetClaims([
+    { sender: carol, recipient: bob, amount: 50n, epoch: 1 }
+  ]).claims;
+
+  const merged = mergeClaims([preClaims, mainClaims]);
+
+  assert.deepEqual(merged, [
+    { address: bob, amount: "150", epoch: "1" }
+  ]);
+});
+
+test("mergeClaims keeps later main-migration epochs separate while rebuilding cumulatively", () => {
+  const preClaims = buildNetClaims([
+    { sender: alice, recipient: bob, amount: 100n, epoch: 1 }
+  ]).claims;
+  const mainEpochOneClaims = buildNetClaims([
+    { sender: carol, recipient: bob, amount: 50n, epoch: 1 }
+  ]).claims;
+  const mainEpochTwoClaims = buildNetClaims([
+    { sender: alice, recipient: bob, amount: 25n, epoch: 2 }
+  ]).claims;
+
+  const merged = mergeClaims([preClaims, mainEpochOneClaims, mainEpochTwoClaims]);
+
+  assert.deepEqual(merged, [
+    { address: bob, amount: "150", epoch: "1" },
+    { address: bob, amount: "25", epoch: "2" }
+  ]);
 });

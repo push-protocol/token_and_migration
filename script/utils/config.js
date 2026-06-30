@@ -2,15 +2,22 @@
  * Configuration for event fetching and merkle proof generation.
  */
 
-const LOCKER_CONFIG = {
-  CONTRACT_ADDRESS: "",
-  ABI: [
-    "event Locked(address caller, address recipient, uint256 amount, uint256 epoch)",
-    "event Unlocked(address sender, address recipient, uint256 amount, uint256 epoch)",
-    "function epoch() view returns (uint256)",
-    "function epochStartBlock(uint256) view returns (uint256)"
-  ],
-  FILTER_EPOCHS: []
+const LOCKER_EVENT_ABI = [
+  "event Locked(address caller, address recipient, uint256 amount, uint256 epoch)",
+  "event Unlocked(address sender, address recipient, uint256 amount, uint256 epoch)",
+  "function epoch() view returns (uint256)",
+  "function epochStartBlock(uint256) view returns (uint256)"
+];
+
+const LOCKER_SOURCES = {
+  preMigration: {
+    CONTRACT_ADDRESS: "",
+    FILTER_EPOCHS: [1]
+  },
+  migration: {
+    CONTRACT_ADDRESS: "",
+    FILTER_EPOCHS: []
+  }
 };
 
 const OUTPUT_CONFIG = {
@@ -18,6 +25,7 @@ const OUTPUT_CONFIG = {
 };
 
 module.exports = {
-  LOCKER_CONFIG,
+  LOCKER_EVENT_ABI,
+  LOCKER_SOURCES,
   OUTPUT_CONFIG
 };

@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const { LOCKER_CONFIG, OUTPUT_CONFIG } = require("./config");
+const { LOCKER_EVENT_ABI, LOCKER_SOURCES, OUTPUT_CONFIG } = require("./config");
 
 const PUSH_TOKEN_ADDRESS = "0xf418588522d5dd018b425E472991E52EBBeEEEEE";
 const PUSH_TOKEN_ABI = [
@@ -106,6 +106,43 @@ function buildNetClaims(lockedEntries, unlockedEntries = []) {
   };
 }
 
+function mergeClaims(claimGroups) {
+  const merged = Object.create(null);
+
+  for (const claimGroup of claimGroups) {
+    for (const claim of claimGroup) {
+      const amount = toBigInt(claim.amount);
+      const epoch = claim.epoch.toString();
+      const key = recipientEpochKey(claim.address, epoch);
+      const current = merged[key];
+
+      if (current) {
+        current.amount += amount;
+      } else {
+        merged[key] = {
+          address: claim.address,
+          amount,
+          epoch
+        };
+      }
+    }
+  }
+
+  return Object.values(merged)
+    .filter((claim) => claim.amount > 0n)
+    .sort((a, b) => {
+      if (a.epoch !== b.epoch) {
+        return Number(a.epoch) - Number(b.epoch);
+      }
+      return a.address.toLowerCase().localeCompare(b.address.toLowerCase());
+    })
+    .map((claim) => ({
+      address: claim.address,
+      amount: claim.amount.toString(),
+      epoch: claim.epoch
+    }));
+}
+
 function normalizeLockedEvents(events) {
   return events.map((event) => ({
     sender: event.args.caller,
@@ -122,6 +159,36 @@ function normalizeUnlockedEvents(events) {
     amount: event.args.amount,
     epoch: Number(event.args.epoch)
   }));
+}
+
+function resolveLockerSources() {
+  const preMigrationAddress = LOCKER_SOURCES.preMigration?.CONTRACT_ADDRESS?.trim();
+  const migrationAddress = LOCKER_SOURCES.migration?.CONTRACT_ADDRESS?.trim();
+
+  if (!preMigrationAddress || !migrationAddress) {
+    throw new Error("Both preMigration and migration contract addresses must be configured");
+  }
+
+  if (preMigrationAddress.toLowerCase() === migrationAddress.toLowerCase()) {
+    throw new Error("preMigration and migration must be different contract addresses");
+  }
+
+  return [
+    {
+      NAME: "pre-migration",
+      CONTRACT_ADDRESS: preMigrationAddress,
+      ABI: LOCKER_EVENT_ABI,
+      FILTER_EPOCHS: LOCKER_SOURCES.preMigration.FILTER_EPOCHS || [1],
+      INCLUDE_UNLOCKED: true
+    },
+    {
+      NAME: "migration",
+      CONTRACT_ADDRESS: migrationAddress,
+      ABI: LOCKER_EVENT_ABI,
+      FILTER_EPOCHS: LOCKER_SOURCES.migration.FILTER_EPOCHS || [],
+      INCLUDE_UNLOCKED: false
+    }
+  ];
 }
 
 async function getEpochsToProcess(locker, filterEpochs) {
@@ -219,49 +286,67 @@ async function main() {
 
   const provider = ethers.provider;
   const pushToken = new ethers.Contract(PUSH_TOKEN_ADDRESS, PUSH_TOKEN_ABI, provider);
-  const locker = new ethers.Contract(LOCKER_CONFIG.CONTRACT_ADDRESS, LOCKER_CONFIG.ABI, provider);
-  const source = { NAME: "migration-locker", CONTRACT_ADDRESS: LOCKER_CONFIG.CONTRACT_ADDRESS };
+  const sources = resolveLockerSources();
+  const mergedClaimGroups = [];
 
-  const { currentEpoch, epochsToProcess } = await getEpochsToProcess(locker, LOCKER_CONFIG.FILTER_EPOCHS);
+  for (const source of sources) {
+    const locker = new ethers.Contract(source.CONTRACT_ADDRESS, source.ABI, provider);
+    const { currentEpoch, epochsToProcess } = await getEpochsToProcess(locker, source.FILTER_EPOCHS);
 
-  if (epochsToProcess.length === 0) {
-    console.log(`⚠️  No epochs to process (current epoch: ${currentEpoch})`);
-    return;
+    if (epochsToProcess.length === 0) {
+      console.log(`⚠️  Skipping ${source.NAME}: no matching epochs under current epoch ${currentEpoch}`);
+      continue;
+    }
+
+    const epochWindow = await getEpochWindow(locker, currentEpoch, epochsToProcess);
+    console.log(`\n📦 Source: ${source.NAME}`);
+    console.log(`   Address: ${source.CONTRACT_ADDRESS}`);
+    console.log(`   Current epoch: ${currentEpoch}`);
+    console.log(`   Epochs: ${epochsToProcess.join(", ")}`);
+    console.log(`   Blocks: ${epochWindow.startBlock} -> ${epochWindow.endBlock}`);
+
+    const lockedEvents = await locker.queryFilter("Locked", epochWindow.startBlock, epochWindow.endBlock);
+    const unlockedEvents = source.INCLUDE_UNLOCKED
+      ? await locker.queryFilter("Unlocked", epochWindow.startBlock, epochWindow.endBlock)
+      : [];
+
+    const filteredLockedEvents = normalizeLockedEvents(lockedEvents).filter((event) =>
+      epochsToProcess.includes(event.epoch)
+    );
+    const filteredUnlockedEvents = normalizeUnlockedEvents(unlockedEvents).filter((event) =>
+      epochsToProcess.includes(event.epoch)
+    );
+
+    const sourceResult = buildNetClaims(filteredLockedEvents, filteredUnlockedEvents);
+
+    console.log(`   Locked events: ${filteredLockedEvents.length}`);
+    console.log(`   Unlocked events: ${filteredUnlockedEvents.length}`);
+    console.log(`   Net claims: ${sourceResult.claims.length}`);
+
+    await validateSourceEpochTotals(
+      source,
+      sourceResult,
+      pushToken,
+      locker,
+      currentEpoch,
+      epochsToProcess
+    );
+
+    mergedClaimGroups.push(sourceResult.claims);
   }
 
-  const epochWindow = await getEpochWindow(locker, currentEpoch, epochsToProcess);
-  console.log(`\n📦 Processing locker: ${LOCKER_CONFIG.CONTRACT_ADDRESS}`);
-  console.log(`   Current epoch: ${currentEpoch}`);
-  console.log(`   Epochs: ${epochsToProcess.join(", ")}`);
-  console.log(`   Blocks: ${epochWindow.startBlock} -> ${epochWindow.endBlock}`);
-
-  const lockedEvents = await locker.queryFilter("Locked", epochWindow.startBlock, epochWindow.endBlock);
-  const unlockedEvents = await locker.queryFilter("Unlocked", epochWindow.startBlock, epochWindow.endBlock);
-
-  const filteredLockedEvents = normalizeLockedEvents(lockedEvents).filter((event) =>
-    epochsToProcess.includes(event.epoch)
-  );
-  const filteredUnlockedEvents = normalizeUnlockedEvents(unlockedEvents).filter((event) =>
-    epochsToProcess.includes(event.epoch)
-  );
-
-  const sourceResult = buildNetClaims(filteredLockedEvents, filteredUnlockedEvents);
-
-  console.log(`   Locked events: ${filteredLockedEvents.length}`);
-  console.log(`   Unlocked events: ${filteredUnlockedEvents.length}`);
-  console.log(`   Net claims: ${sourceResult.claims.length}`);
-
-  await validateSourceEpochTotals(source, sourceResult, pushToken, locker, currentEpoch, epochsToProcess);
-
+  const claims = mergeClaims(mergedClaimGroups);
   const outputPath = path.join(__dirname, OUTPUT_CONFIG.CLAIMS_PATH);
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  fs.writeFileSync(outputPath, JSON.stringify(sourceResult.claims, null, 2));
+  fs.writeFileSync(outputPath, JSON.stringify(claims, null, 2));
 
-  console.log(`\n✅ Saved ${sourceResult.claims.length} net claims to ${outputPath}`);
+  console.log(`\n✅ Saved ${claims.length} merged claims to ${outputPath}`);
 }
 
 module.exports = {
   buildNetClaims,
+  mergeClaims,
+  resolveLockerSources,
   main
 };
 
