@@ -1,11 +1,28 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { ethers } = require("hardhat");
 
+const { LOCKER_CONFIG } = require("./config");
 const { buildNetClaims } = require("./fetchAndStoreEvents");
 
 const alice = "0x00000000000000000000000000000000000000a1";
 const bob = "0x00000000000000000000000000000000000000b2";
 const carol = "0x00000000000000000000000000000000000000c3";
+
+test("LOCKER_CONFIG ABI decodes indexed Unlocked logs", () => {
+  const eventAbi = [
+    "event Unlocked(address indexed sender, address indexed recipient, uint256 amount, uint256 epoch)"
+  ];
+  const actualInterface = new ethers.Interface(eventAbi);
+  const builderInterface = new ethers.Interface(LOCKER_CONFIG.ABI);
+  const encoded = actualInterface.encodeEventLog(actualInterface.getEvent("Unlocked"), [alice, bob, 100n, 1n]);
+  const decoded = builderInterface.decodeEventLog("Unlocked", encoded.data, encoded.topics);
+
+  assert.equal(decoded.sender.toLowerCase(), alice);
+  assert.equal(decoded.recipient.toLowerCase(), bob);
+  assert.equal(decoded.amount, 100n);
+  assert.equal(decoded.epoch, 1n);
+});
 
 test("buildNetClaims handles locked entries", () => {
   const result = buildNetClaims([
