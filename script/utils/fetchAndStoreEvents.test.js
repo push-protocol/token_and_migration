@@ -1,7 +1,8 @@
 const { afterEach, test } = require("node:test");
 const assert = require("node:assert/strict");
+const { ethers } = require("hardhat");
 
-const { LOCKER_SOURCES } = require("./config");
+const { LOCKER_EVENT_ABI, LOCKER_SOURCES } = require("./config");
 const { buildNetClaims, mergeClaims, resolveLockerSources } = require("./fetchAndStoreEvents");
 
 const alice = "0x00000000000000000000000000000000000000a1";
@@ -51,7 +52,7 @@ test("resolveLockerSources builds the fixed two-source topology", () => {
       CONTRACT_ADDRESS: "0x00000000000000000000000000000000000000aa",
       ABI: [
         "event Locked(address caller, address recipient, uint256 amount, uint256 epoch)",
-        "event Unlocked(address sender, address recipient, uint256 amount, uint256 epoch)",
+        "event Unlocked(address indexed sender, address indexed recipient, uint256 amount, uint256 epoch)",
         "function epoch() view returns (uint256)",
         "function epochStartBlock(uint256) view returns (uint256)"
       ],
@@ -63,7 +64,7 @@ test("resolveLockerSources builds the fixed two-source topology", () => {
       CONTRACT_ADDRESS: "0x00000000000000000000000000000000000000bb",
       ABI: [
         "event Locked(address caller, address recipient, uint256 amount, uint256 epoch)",
-        "event Unlocked(address sender, address recipient, uint256 amount, uint256 epoch)",
+        "event Unlocked(address indexed sender, address indexed recipient, uint256 amount, uint256 epoch)",
         "function epoch() view returns (uint256)",
         "function epochStartBlock(uint256) view returns (uint256)"
       ],
@@ -71,6 +72,21 @@ test("resolveLockerSources builds the fixed two-source topology", () => {
       INCLUDE_UNLOCKED: false
     }
   ]);
+});
+
+test("LOCKER_EVENT_ABI decodes indexed Unlocked logs", () => {
+  const eventAbi = [
+    "event Unlocked(address indexed sender, address indexed recipient, uint256 amount, uint256 epoch)"
+  ];
+  const actualInterface = new ethers.Interface(eventAbi);
+  const builderInterface = new ethers.Interface(LOCKER_EVENT_ABI);
+  const encoded = actualInterface.encodeEventLog(actualInterface.getEvent("Unlocked"), [alice, bob, 100n, 1n]);
+  const decoded = builderInterface.decodeEventLog("Unlocked", encoded.data, encoded.topics);
+
+  assert.equal(decoded.sender.toLowerCase(), alice);
+  assert.equal(decoded.recipient.toLowerCase(), bob);
+  assert.equal(decoded.amount, 100n);
+  assert.equal(decoded.epoch, 1n);
 });
 
 test("buildNetClaims handles pre-migration locked entries", () => {

@@ -4,7 +4,7 @@
 
 const LOCKER_EVENT_ABI = [
   "event Locked(address caller, address recipient, uint256 amount, uint256 epoch)",
-  "event Unlocked(address sender, address recipient, uint256 amount, uint256 epoch)",
+  "event Unlocked(address indexed sender, address indexed recipient, uint256 amount, uint256 epoch)",
   "function epoch() view returns (uint256)",
   "function epochStartBlock(uint256) view returns (uint256)"
 ];
