@@ -1,169 +1,273 @@
 const fs = require("fs");
 const path = require("path");
-const { ethers } = require("hardhat");
 const { LOCKER_CONFIG, OUTPUT_CONFIG } = require("./config");
 
-async function main() {
-  const CONTRACT_ADDRESS = LOCKER_CONFIG.CONTRACT_ADDRESS;
-  const LOCKER_ABI = LOCKER_CONFIG.ABI;
-  const FILTER_EPOCHS = LOCKER_CONFIG.FILTER_EPOCHS;
-  const PUSH_TOKEN_ADDRESS = "0xf418588522d5dd018b425E472991E52EBBeEEEEE";
+const PUSH_TOKEN_ADDRESS = "0xf418588522d5dd018b425E472991E52EBBeEEEEE";
+const PUSH_TOKEN_ABI = [
+  "function balanceOf(address account) view returns (uint256)"
+];
 
-  const provider = ethers.provider;
-  const locker = new ethers.Contract(CONTRACT_ADDRESS, LOCKER_ABI, provider);
+function toBigInt(value) {
+  return typeof value === "bigint" ? value : BigInt(value.toString());
+}
 
-  // Add PUSH token interface for balance validation
-  const pushToken = new ethers.Contract(PUSH_TOKEN_ADDRESS, [
-    "function balanceOf(address account) view returns (uint256)"
-  ], provider);
+function senderRecipientEpochKey(sender, recipient, epoch) {
+  return `${sender.toLowerCase()}-${recipient.toLowerCase()}-${epoch}`;
+}
 
-  // Get current epoch from contract
-  const currentEpoch = await locker.epoch();
-  console.log(`🔢 Current epoch: ${currentEpoch}`);
+function recipientEpochKey(recipient, epoch) {
+  return `${recipient.toLowerCase()}-${epoch}`;
+}
 
-  // Determine which epochs to process
-  let epochsToProcess = [];
-  if (FILTER_EPOCHS && FILTER_EPOCHS.length > 0) {
-    epochsToProcess = FILTER_EPOCHS.filter(e => e <= currentEpoch);
-    console.log(`🔍 Processing specific epochs: ${epochsToProcess.join(', ')}`);
-  } else {
-    // Process all epochs from 1 to current
-    for (let i = 1; i <= currentEpoch; i++) {
-      epochsToProcess.push(i);
+function addAmountByEpoch(totalsByEpoch, epoch, amount) {
+  const key = epoch.toString();
+  totalsByEpoch[key] = (totalsByEpoch[key] || 0n) + amount;
+}
+
+function buildNetClaims(lockedEntries, unlockedEntries = []) {
+  const senderRecipientBalances = Object.create(null);
+  const recipientEpochBalances = Object.create(null);
+  const lockedTotalsByEpoch = Object.create(null);
+  const unlockedTotalsByEpoch = Object.create(null);
+
+  for (const entry of lockedEntries) {
+    const amount = toBigInt(entry.amount);
+    const epoch = entry.epoch.toString();
+    const key = senderRecipientEpochKey(entry.sender, entry.recipient, epoch);
+    const current = senderRecipientBalances[key];
+
+    if (current) {
+      current.amount += amount;
+    } else {
+      senderRecipientBalances[key] = {
+        sender: entry.sender,
+        recipient: entry.recipient,
+        epoch,
+        amount
+      };
     }
-    console.log(`🔍 Processing all epochs from 1 to ${currentEpoch}`);
+
+    addAmountByEpoch(lockedTotalsByEpoch, epoch, amount);
   }
 
-  // Get the overall start and end blocks for the entire range
+  for (const entry of unlockedEntries) {
+    const amount = toBigInt(entry.amount);
+    const epoch = entry.epoch.toString();
+    const key = senderRecipientEpochKey(entry.sender, entry.recipient, epoch);
+    const current = senderRecipientBalances[key];
+
+    if (!current || current.amount < amount) {
+      throw new Error(
+        `Negative net amount for ${entry.sender} -> ${entry.recipient} in epoch ${epoch}`
+      );
+    }
+
+    current.amount -= amount;
+    addAmountByEpoch(unlockedTotalsByEpoch, epoch, amount);
+  }
+
+  for (const claimableBalance of Object.values(senderRecipientBalances)) {
+    if (claimableBalance.amount === 0n) {
+      continue;
+    }
+
+    const key = recipientEpochKey(claimableBalance.recipient, claimableBalance.epoch);
+    const current = recipientEpochBalances[key];
+
+    if (current) {
+      current.amount += claimableBalance.amount;
+    } else {
+      recipientEpochBalances[key] = {
+        address: claimableBalance.recipient,
+        amount: claimableBalance.amount,
+        epoch: claimableBalance.epoch
+      };
+    }
+  }
+
+  const claims = Object.values(recipientEpochBalances)
+    .filter((claim) => claim.amount > 0n)
+    .sort((a, b) => {
+      if (a.epoch !== b.epoch) {
+        return Number(a.epoch) - Number(b.epoch);
+      }
+      return a.address.toLowerCase().localeCompare(b.address.toLowerCase());
+    })
+    .map((claim) => ({
+      address: claim.address,
+      amount: claim.amount.toString(),
+      epoch: claim.epoch
+    }));
+
+  return {
+    claims,
+    lockedTotalsByEpoch,
+    unlockedTotalsByEpoch
+  };
+}
+
+function normalizeLockedEvents(events) {
+  return events.map((event) => ({
+    sender: event.args.caller,
+    recipient: event.args.recipient,
+    amount: event.args.amount,
+    epoch: Number(event.args.epoch)
+  }));
+}
+
+function normalizeUnlockedEvents(events) {
+  return events.map((event) => ({
+    sender: event.args.sender,
+    recipient: event.args.recipient,
+    amount: event.args.amount,
+    epoch: Number(event.args.epoch)
+  }));
+}
+
+async function getEpochsToProcess(locker, filterEpochs) {
+  const currentEpoch = Number(await locker.epoch());
+  let epochsToProcess = [];
+
+  if (filterEpochs && filterEpochs.length > 0) {
+    epochsToProcess = filterEpochs.filter((epoch) => epoch <= currentEpoch);
+  } else {
+    for (let epoch = 1; epoch <= currentEpoch; epoch++) {
+      epochsToProcess.push(epoch);
+    }
+  }
+
+  return {
+    currentEpoch,
+    epochsToProcess
+  };
+}
+
+async function getEpochWindow(locker, currentEpoch, epochsToProcess) {
+  if (epochsToProcess.length === 0) {
+    return null;
+  }
+
   const firstEpoch = Math.min(...epochsToProcess);
   const lastEpoch = Math.max(...epochsToProcess);
+  const startBlock = Number(await locker.epochStartBlock(firstEpoch));
 
-  const startBlock = await locker.epochStartBlock(firstEpoch);
   let endBlock = "latest";
   if (lastEpoch < currentEpoch) {
     const nextEpochStart = await locker.epochStartBlock(lastEpoch + 1);
     endBlock = Number(nextEpochStart) - 1;
   }
 
-  console.log(`📊 Fetching all Locked events from blocks ${startBlock} to ${endBlock}...`);
+  return { startBlock, endBlock };
+}
 
-  // Single query for all events in the range
-  const allEvents = await locker.queryFilter("Locked", startBlock, endBlock);
-  console.log(`📦 Found ${allEvents.length} total Locked events`);
+async function getOnChainEpochDelta(pushToken, locker, contractAddress, epoch, currentEpoch) {
+  if (epoch === currentEpoch) {
+    const currentBalance = toBigInt(await pushToken.balanceOf(contractAddress));
+    const epochStart = Number(await locker.epochStartBlock(currentEpoch));
+    const balanceBeforeEpoch = toBigInt(
+      await pushToken.balanceOf(contractAddress, { blockTag: epochStart - 1 })
+    );
 
-  // Group events by address and combine amounts
-  const addressAmounts = {};
-  let totalEvents = 0;
-  const epochTotals = {}; // Track total amount per epoch from events
-
-  // Process events and filter by epoch on the client side
-  for (const event of allEvents) {
-    const eventEpoch = Number(event.args.epoch);
-
-    // Skip events from epochs we're not interested in
-    if (!epochsToProcess.includes(eventEpoch)) {
-      continue;
-    }
-
-    const address = event.args.recipient;
-    const amount = BigInt(event.args.amount.toString());
-
-    const key = `${address}-${eventEpoch}`;
-
-    if (addressAmounts[key]) {
-      // Address already exists in this epoch, add to existing amount
-      addressAmounts[key].amount = addressAmounts[key].amount + amount;
-      console.log(`📝 Combined amount for ${address} in epoch ${eventEpoch}`);
-    } else {
-      // First occurrence of this address in this epoch
-      addressAmounts[key] = {
-        address: address,
-        amount: amount,
-        epoch: eventEpoch.toString()
-      };
-    }
-
-    // Track total per epoch
-    if (!epochTotals[eventEpoch]) {
-      epochTotals[eventEpoch] = BigInt(0);
-    }
-    epochTotals[eventEpoch] += amount;
-
-    totalEvents++;
+    return currentBalance - balanceBeforeEpoch;
   }
 
-  // Convert to array format with combined amounts
-  const claims = Object.values(addressAmounts).map(claim => ({
-    address: claim.address,
-    amount: claim.amount.toString(),
-    epoch: claim.epoch
-  }));
+  const epochStart = Number(await locker.epochStartBlock(epoch));
+  const nextEpochStart = Number(await locker.epochStartBlock(epoch + 1));
+  const endBalance = toBigInt(
+    await pushToken.balanceOf(contractAddress, { blockTag: nextEpochStart - 1 })
+  );
+  const startBalance = toBigInt(
+    await pushToken.balanceOf(contractAddress, { blockTag: epochStart - 1 })
+  );
 
-  console.log(`📊 Processed ${totalEvents} events into ${claims.length} unique address-epoch combinations`);
+  return endBalance - startBalance;
+}
 
-  // Show some statistics
-  const duplicateCount = totalEvents - claims.length;
-  if (duplicateCount > 0) {
-    console.log(`🔄 Combined ${duplicateCount} duplicate addresses`);
-  }
-
-  // Validate that sum of all leaves equals on-chain locked amounts
-  console.log(`\n🔍 Validating totals against on-chain state...`);
+async function validateSourceEpochTotals(source, sourceResult, pushToken, locker, currentEpoch, epochsToProcess) {
+  console.log(`\n🔍 Validating ${source.NAME} against on-chain balances...`);
 
   for (const epoch of epochsToProcess) {
-    const offChainTotal = epochTotals[epoch] || BigInt(0);
+    const epochKey = epoch.toString();
+    const lockedTotal = sourceResult.lockedTotalsByEpoch[epochKey] || 0n;
+    const unlockedTotal = sourceResult.unlockedTotalsByEpoch[epochKey] || 0n;
+    const offChainNet = lockedTotal - unlockedTotal;
+    const onChainNet = await getOnChainEpochDelta(
+      pushToken,
+      locker,
+      source.CONTRACT_ADDRESS,
+      epoch,
+      currentEpoch
+    );
 
-    // Get on-chain total (incremental balance for this epoch)
-    let onChainTotal;
-    if (epoch === currentEpoch) {
-      // For current epoch: current balance minus balance at start of current epoch
-      const currentBalance = await pushToken.balanceOf(CONTRACT_ADDRESS);
-      const currentEpochStart = await locker.epochStartBlock(currentEpoch);
-      const balanceAtStart = await pushToken.balanceOf(CONTRACT_ADDRESS, {
-        blockTag: Number(currentEpochStart) - 1
-      });
-      onChainTotal = currentBalance - balanceAtStart;
-    } else {
-      // For past epochs: balance at end of epoch minus balance at start of epoch
-      const nextEpochStart = await locker.epochStartBlock(epoch + 1);
-      const epochStart = await locker.epochStartBlock(epoch);
-
-      const endBlockOfEpoch = Number(nextEpochStart) - 1;
-      const startBlockOfEpoch = Number(epochStart) - 1;
-
-      const endBalance = await pushToken.balanceOf(CONTRACT_ADDRESS, { blockTag: endBlockOfEpoch });
-      const startBalance = await pushToken.balanceOf(CONTRACT_ADDRESS, { blockTag: startBlockOfEpoch });
-      onChainTotal = endBalance - startBalance;
+    if (offChainNet !== onChainNet) {
+      console.error(`❌ Validation failed for ${source.NAME} epoch ${epoch}:`);
+      console.error(`   Locked total: ${lockedTotal.toString()}`);
+      console.error(`   Unlocked total: ${unlockedTotal.toString()}`);
+      console.error(`   Off-chain net: ${offChainNet.toString()}`);
+      console.error(`   On-chain net: ${onChainNet.toString()}`);
+      throw new Error(`Funds mismatch for ${source.NAME} epoch ${epoch}`);
     }
 
-    if (offChainTotal !== onChainTotal) {
-      console.error(`❌ Validation failed for epoch ${epoch}:`);
-      console.error(`   Off-chain total: ${offChainTotal.toString()}`);
-      console.error(`   On-chain total: ${onChainTotal.toString()}`);
-      console.error(`   Difference: ${(offChainTotal > onChainTotal ? offChainTotal - onChainTotal : onChainTotal - offChainTotal).toString()}`);
-      throw new Error(`Funds may be missing for epoch ${epoch}`);
-    }
+    console.log(
+      `✅ ${source.NAME} epoch ${epoch}: ${lockedTotal.toString()} locked, ${unlockedTotal.toString()} unlocked, ${offChainNet.toString()} net`
+    );
+  }
+}
 
-    console.log(`✅ Epoch ${epoch}: ${offChainTotal.toString()} wei`);
+async function main() {
+  const { ethers } = require("hardhat");
+
+  const provider = ethers.provider;
+  const pushToken = new ethers.Contract(PUSH_TOKEN_ADDRESS, PUSH_TOKEN_ABI, provider);
+  const locker = new ethers.Contract(LOCKER_CONFIG.CONTRACT_ADDRESS, LOCKER_CONFIG.ABI, provider);
+  const source = { NAME: "migration-locker", CONTRACT_ADDRESS: LOCKER_CONFIG.CONTRACT_ADDRESS };
+
+  const { currentEpoch, epochsToProcess } = await getEpochsToProcess(locker, LOCKER_CONFIG.FILTER_EPOCHS);
+
+  if (epochsToProcess.length === 0) {
+    console.log(`⚠️  No epochs to process (current epoch: ${currentEpoch})`);
+    return;
   }
 
-  console.log(`\n✅ All validations passed!`);
+  const epochWindow = await getEpochWindow(locker, currentEpoch, epochsToProcess);
+  console.log(`\n📦 Processing locker: ${LOCKER_CONFIG.CONTRACT_ADDRESS}`);
+  console.log(`   Current epoch: ${currentEpoch}`);
+  console.log(`   Epochs: ${epochsToProcess.join(", ")}`);
+  console.log(`   Blocks: ${epochWindow.startBlock} -> ${epochWindow.endBlock}`);
+
+  const lockedEvents = await locker.queryFilter("Locked", epochWindow.startBlock, epochWindow.endBlock);
+  const unlockedEvents = await locker.queryFilter("Unlocked", epochWindow.startBlock, epochWindow.endBlock);
+
+  const filteredLockedEvents = normalizeLockedEvents(lockedEvents).filter((event) =>
+    epochsToProcess.includes(event.epoch)
+  );
+  const filteredUnlockedEvents = normalizeUnlockedEvents(unlockedEvents).filter((event) =>
+    epochsToProcess.includes(event.epoch)
+  );
+
+  const sourceResult = buildNetClaims(filteredLockedEvents, filteredUnlockedEvents);
+
+  console.log(`   Locked events: ${filteredLockedEvents.length}`);
+  console.log(`   Unlocked events: ${filteredUnlockedEvents.length}`);
+  console.log(`   Net claims: ${sourceResult.claims.length}`);
+
+  await validateSourceEpochTotals(source, sourceResult, pushToken, locker, currentEpoch, epochsToProcess);
 
   const outputPath = path.join(__dirname, OUTPUT_CONFIG.CLAIMS_PATH);
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  fs.writeFileSync(outputPath, JSON.stringify(claims, null, 2));
+  fs.writeFileSync(outputPath, JSON.stringify(sourceResult.claims, null, 2));
 
-  console.log(`✅ Saved ${claims.length} unique claims to ${outputPath}`);
-
-  // Optional: Show top 5 addresses by amount for verification
-  const sortedClaims = claims.sort((a, b) => {
-    const amountA = BigInt(a.amount);
-    const amountB = BigInt(b.amount);
-    return amountB > amountA ? 1 : amountB < amountA ? -1 : 0;
-  });
+  console.log(`\n✅ Saved ${sourceResult.claims.length} net claims to ${outputPath}`);
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+module.exports = {
+  buildNetClaims,
+  main
+};
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

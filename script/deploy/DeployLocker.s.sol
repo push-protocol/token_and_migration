@@ -20,6 +20,7 @@ contract DeployLockerScript is Script {
         // Get private key from environment
         uint256 deployerPrivateKey = vm.envUint("DEPLOYER_OWNER");
         address deployerAddress = vm.addr(deployerPrivateKey);
+        bool refundsEnabled = vm.envOr("REFUNDS_ENABLED", false);
 
         vm.startBroadcast(deployerPrivateKey);
 
@@ -30,7 +31,8 @@ contract DeployLockerScript is Script {
 
         bytes memory initData = abi.encodeWithSelector(
             MigrationLocker.initialize.selector,
-            deployerAddress // Set deployer as initial owner
+            deployerAddress, // Set deployer as initial owner
+            refundsEnabled
         );
 
         TransparentUpgradeableProxy proxy =
