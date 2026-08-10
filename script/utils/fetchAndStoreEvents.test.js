@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const { ethers } = require("hardhat");
 
 const { LOCKER_EVENT_ABI, LOCKER_SOURCES } = require("./config");
-const { buildNetClaims, mergeClaims, resolveLockerSources } = require("./fetchAndStoreEvents");
+const { buildNetClaims, mergeClaims, reconcileEpochTotals, resolveLockerSources } = require("./fetchAndStoreEvents");
 
 const alice = "0x00000000000000000000000000000000000000a1";
 const bob = "0x00000000000000000000000000000000000000b2";
@@ -140,6 +140,21 @@ test("buildNetClaims rejects negative net amounts", () => {
         [{ sender: alice, recipient: bob, amount: 11n, epoch: 1 }]
       ),
     /Negative net amount/
+  );
+});
+
+test("reconcileEpochTotals accepts exact reconciliation", () => {
+  assert.doesNotThrow(() => reconcileEpochTotals("migration", 1, 100n, 10n, 90n, 90n));
+});
+
+test("reconcileEpochTotals accepts unexplained PUSH surplus", () => {
+  assert.doesNotThrow(() => reconcileEpochTotals("migration", 1, 100n, 10n, 90n, 91n));
+});
+
+test("reconcileEpochTotals rejects on-chain deficits", () => {
+  assert.throws(
+    () => reconcileEpochTotals("migration", 1, 100n, 10n, 90n, 89n),
+    /Funds deficit/
   );
 });
 

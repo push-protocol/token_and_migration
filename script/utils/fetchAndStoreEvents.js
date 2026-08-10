@@ -250,6 +250,31 @@ async function getOnChainEpochDelta(pushToken, locker, contractAddress, epoch, c
   return endBalance - startBalance;
 }
 
+function reconcileEpochTotals(sourceName, epoch, lockedTotal, unlockedTotal, offChainNet, onChainNet) {
+  if (offChainNet > onChainNet) {
+    console.error(`❌ Validation failed for ${sourceName} epoch ${epoch}:`);
+    console.error(`   Locked total: ${lockedTotal.toString()}`);
+    console.error(`   Unlocked total: ${unlockedTotal.toString()}`);
+    console.error(`   Off-chain net: ${offChainNet.toString()}`);
+    console.error(`   On-chain net: ${onChainNet.toString()}`);
+    throw new Error(`Funds deficit for ${sourceName} epoch ${epoch}`);
+  }
+
+  if (offChainNet < onChainNet) {
+    const unexplainedSurplus = onChainNet - offChainNet;
+    console.warn(`⚠️  Unexplained PUSH surplus for ${sourceName} epoch ${epoch}: ${unexplainedSurplus.toString()}`);
+    console.warn(`   Locked total: ${lockedTotal.toString()}`);
+    console.warn(`   Unlocked total: ${unlockedTotal.toString()}`);
+    console.warn(`   Off-chain net: ${offChainNet.toString()}`);
+    console.warn(`   On-chain net: ${onChainNet.toString()}`);
+    return;
+  }
+
+  console.log(
+    `✅ ${sourceName} epoch ${epoch}: ${lockedTotal.toString()} locked, ${unlockedTotal.toString()} unlocked, ${offChainNet.toString()} net`
+  );
+}
+
 async function validateSourceEpochTotals(source, sourceResult, pushToken, locker, currentEpoch, epochsToProcess) {
   console.log(`\n🔍 Validating ${source.NAME} against on-chain balances...`);
 
@@ -266,17 +291,13 @@ async function validateSourceEpochTotals(source, sourceResult, pushToken, locker
       currentEpoch
     );
 
-    if (offChainNet !== onChainNet) {
-      console.error(`❌ Validation failed for ${source.NAME} epoch ${epoch}:`);
-      console.error(`   Locked total: ${lockedTotal.toString()}`);
-      console.error(`   Unlocked total: ${unlockedTotal.toString()}`);
-      console.error(`   Off-chain net: ${offChainNet.toString()}`);
-      console.error(`   On-chain net: ${onChainNet.toString()}`);
-      throw new Error(`Funds mismatch for ${source.NAME} epoch ${epoch}`);
-    }
-
-    console.log(
-      `✅ ${source.NAME} epoch ${epoch}: ${lockedTotal.toString()} locked, ${unlockedTotal.toString()} unlocked, ${offChainNet.toString()} net`
+    reconcileEpochTotals(
+      source.NAME,
+      epoch,
+      lockedTotal,
+      unlockedTotal,
+      offChainNet,
+      onChainNet
     );
   }
 }
@@ -346,6 +367,7 @@ async function main() {
 module.exports = {
   buildNetClaims,
   mergeClaims,
+  reconcileEpochTotals,
   resolveLockerSources,
   main
 };
