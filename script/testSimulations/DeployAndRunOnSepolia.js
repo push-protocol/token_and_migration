@@ -4,6 +4,7 @@ const { ethers } = require("hardhat");
 
 async function main() {
   const TOKEN_ADDRESS = "0x37c779a1564DCc0e3914aB130e0e787d93e21804"; // PUSH Token
+  const refundsEnabled = process.env.REFUNDS_ENABLED === "true";
   const amountToMint = ethers.parseUnits("1000", 18); // amount each user gets
   const amountToLock = ethers.parseUnits("100", 18);  // amount each user locks
   const amountToLock2 = ethers.parseUnits("250", 18);  // amount each user locks
@@ -22,7 +23,7 @@ async function main() {
   // const locker = MigrationLocker.attach("0x5f4A632526a907003879dAd557dBdcf624EBe992");
   const locker = await upgrades.deployProxy(
     MigrationLocker,
-    [deployer.address],
+    [deployer.address, refundsEnabled],
     { kind: "transparent", initializer: "initialize" }
   );
   await locker.waitForDeployment();
